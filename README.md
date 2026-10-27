@@ -36,7 +36,7 @@ Brug Python 3.10–3.13. Kør i PowerShell i repo-mappen:
 
 Scriptet opretter `.venv`, installerer PyTorch med CUDA og resten af pakkerne og kører testene til sidst. Vil du gøre det i hånden, så se kommandoerne i `setup.bat`.
 
-Scriptet skriver `CUDA: True`, når GPU'en bliver fundet.
+Scriptet skriver `CUDA: True`, når GPU'en bliver fundet. Det bruger PyTorchs CUDA 12.8-build; en anden kan vælges med miljøvariablen `TORCH_INDEX`.
 
 ### 4. Smoke-test
 
