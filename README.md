@@ -48,6 +48,25 @@ Scriptet skriver `CUDA: True`, når GPU'en bliver fundet. Det bruger PyTorchs CU
 
 Den scriptede politik bygger marines og angriber, og den bør vinde mod `VeryEasy`. Det viser, at handlingsrummet kan vinde, før vi begynder at træne. Replays gemmes i `replays/`.
 
+## Træning
+
+```powershell
+.\train.bat                     # 6 parallelle spil mod VeryEasy, 2 mio. beslutninger
+.\train.bat --n-envs 8          # flere spil, hvis CPU og RAM kan følge med
+.\tensorboard.bat               # følg med på http://localhost:6006 (i et andet vindue)
+```
+
+Træningen skriver løbende sejrsprocenten for de seneste 100 spil, og i TensorBoard ligger den under `games/win_rate`. Checkpoints gemmes i `checkpoints/<kørsel>/` for hver 50.000 beslutninger. Ctrl+C stopper og gemmer `interrupted.zip`. En kørsel kan fortsættes med `--resume checkpoints/<kørsel>/<fil>.zip`.
+
+Et SC2-spil, der går ned eller hænger, bliver genstartet automatisk, så en lang kørsel ikke stopper. Sådanne spil tælles i `games/errors`.
+
+Mål sejrsprocenten for en model:
+
+```powershell
+.\evaluate.bat checkpoints\<kørsel>\final.zip --games 20
+.\evaluate.bat checkpoints\<kørsel>\final.zip --difficulty Easy
+```
+
 ## Sådan virker det
 
 | Fil | Indhold |

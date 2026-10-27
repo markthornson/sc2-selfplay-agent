@@ -1,5 +1,8 @@
 """Tests for the env <-> game-worker protocol, using a fake game instead of SC2."""
 
+import os
+from pathlib import Path
+
 import numpy as np
 import pytest
 from sb3_contrib.common.maskable.utils import get_action_masks
@@ -27,6 +30,18 @@ def fake_worker(conn, config):
                 break
         else:
             conn.send(("done", obs, mask, 1.0, {"result": "Victory", "truncated": False}))
+
+
+def crash_once_worker(conn, config):
+    """Dies mid-game the first time it runs (marker file in save_replay_dir), then behaves."""
+    marker = Path(config.save_replay_dir) / "crashed"
+    if not marker.exists():
+        conn.recv()
+        conn.send(("obs", np.zeros(OBS_SIZE, dtype=np.float32), np.ones(NUM_ACTIONS, dtype=bool), 0.0, {}))
+        conn.recv()
+        marker.touch()
+        os._exit(1)
+    fake_worker(conn, config)
 
 
 def broken_worker(conn, config):
@@ -88,5 +103,21 @@ def test_vec_env_auto_resets():
         assert dones.all() and (rewards == 1.0).all()
         assert "terminal_observation" in infos[0]
         assert (obs[:, 0] == 0).all()  # first observation of the next game
+    finally:
+        venv.close()
+
+
+def test_vec_env_restarts_crashed_game(tmp_path):
+    venv = SC2VecEnv([GameConfig(save_replay_dir=str(tmp_path))], worker_fn=crash_once_worker)
+    try:
+        venv.reset()
+        obs, rewards, dones, infos = venv.step(np.zeros(1, dtype=int))
+        assert dones[0] and infos[0]["result"] == "Error"
+        assert infos[0]["TimeLimit.truncated"]
+        for _ in range(GAME_LENGTH - 1):
+            obs, rewards, dones, infos = venv.step(np.zeros(1, dtype=int))
+            assert not dones[0]
+        obs, rewards, dones, infos = venv.step(np.zeros(1, dtype=int))
+        assert dones[0] and infos[0]["result"] == "Victory"
     finally:
         venv.close()

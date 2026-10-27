@@ -7,6 +7,7 @@ Every environment owns one worker process that runs SC2 games back to back.
 from __future__ import annotations
 
 import atexit
+import logging
 import multiprocessing as mp
 import time
 import traceback
@@ -27,6 +28,11 @@ from sc2agent.config import GameConfig
 from sc2agent.features import OBS_CLIP, OBS_SIZE
 
 RECV_TIMEOUT = 600  # seconds; the first game launch can be slow
+MAX_RESET_ATTEMPTS = 3
+# What a broken or hung SC2 worker raises on the env side.
+WORKER_ERRORS = (RuntimeError, TimeoutError, EOFError, BrokenPipeError, OSError)
+
+log = logging.getLogger(__name__)
 
 
 def game_worker(conn, config: GameConfig) -> None:
@@ -77,6 +83,7 @@ class SC2Env(gym.Env):
         self._process = None
         self._in_game = False
         self._mask = np.ones(NUM_ACTIONS, dtype=bool)
+        self._last_obs = np.zeros(OBS_SIZE, dtype=np.float32)
         atexit.register(self.close)
 
     # --- Gymnasium API -------------------------------------------------
@@ -100,14 +107,22 @@ class SC2Env(gym.Env):
             if self._in_game:
                 self._abandon_game()
             self._conn.send("close")
-        except (BrokenPipeError, EOFError, OSError, RuntimeError):
+        except WORKER_ERRORS:
             pass
         self._process.join(timeout=30)
+        self.kill_worker()
+
+    def kill_worker(self) -> None:
+        """Stops the worker process at once; the next reset starts a fresh one."""
+        if self._process is None:
+            return
         if self._process.is_alive():
             self._process.terminate()
+            self._process.join(timeout=10)
         self._conn.close()
         self._process = None
         self._conn = None
+        self._in_game = False
 
     # --- Split API so SC2VecEnv can run several games at once ----------
 
@@ -128,6 +143,7 @@ class SC2Env(gym.Env):
             raise RuntimeError(f"Game ended before the first observation: {info}")
         self._in_game = True
         self._mask = mask
+        self._last_obs = obs
         return obs, info
 
     def _send_action(self, action) -> None:
@@ -138,6 +154,7 @@ class SC2Env(gym.Env):
     def _finish_step(self):
         kind, obs, mask, reward, info = self._receive()
         self._mask = mask
+        self._last_obs = obs
         if kind == "done":
             self._in_game = False
             truncated = bool(info.get("truncated", False))
@@ -166,37 +183,74 @@ class SC2VecEnv(VecEnv):
     def __init__(self, configs: list[GameConfig], worker_fn=game_worker):
         self.envs = [SC2Env(c, worker_fn=worker_fn) for c in configs]
         super().__init__(len(self.envs), self.envs[0].observation_space, self.envs[0].action_space)
-        self._actions = None
+        self._failed: dict[int, Exception] = {}
 
     def reset(self):
-        for env in self.envs:
-            env._begin_reset()
-        results = [env._finish_reset() for env in self.envs]
-        self.reset_infos = [info for _, info in results]
-        return np.stack([obs for obs, _ in results])
+        self.reset_infos = [{} for _ in self.envs]
+        return np.stack(self._reset_envs(range(self.num_envs)))
 
     def step_async(self, actions: np.ndarray) -> None:
-        for env, action in zip(self.envs, actions):
-            env._send_action(action)
+        self._failed = {}
+        for i, (env, action) in enumerate(zip(self.envs, actions)):
+            try:
+                env._send_action(action)
+            except WORKER_ERRORS as e:
+                self._failed[i] = e
 
     def step_wait(self):
-        results = [env._finish_step() for env in self.envs]
         obs_out, rewards, dones, infos = [], [], [], []
         finished = []
-        for i, (obs, reward, terminated, truncated, info) in enumerate(results):
+        for i, env in enumerate(self.envs):
+            try:
+                if i in self._failed:
+                    raise self._failed[i]
+                obs, reward, terminated, truncated, info = env._finish_step()
+            except WORKER_ERRORS as e:
+                # A crashed or hung game must not end a long training run: drop it and start a new one.
+                log.warning("SC2 game %d failed, restarting it: %s", i, e)
+                env.kill_worker()
+                obs, reward, terminated, truncated = env._last_obs, 0.0, False, True
+                info = {"result": "Error", "error": str(e)[-1000:]}
             info = dict(info)
             if terminated or truncated:
                 info["terminal_observation"] = obs
                 info["TimeLimit.truncated"] = truncated and not terminated
-                self.envs[i]._begin_reset()
                 finished.append(i)
             obs_out.append(obs)
             rewards.append(reward)
             dones.append(terminated or truncated)
             infos.append(info)
-        for i in finished:
-            obs_out[i], self.reset_infos[i] = self.envs[i]._finish_reset()
+        for i, obs in zip(finished, self._reset_envs(finished)):
+            obs_out[i] = obs
         return np.stack(obs_out), np.array(rewards, dtype=np.float32), np.array(dones), infos
+
+    def _reset_envs(self, indices) -> list[np.ndarray]:
+        """Starts new games in parallel, retrying any that fail to start."""
+        indices = list(indices)
+        pending = {}
+        for i in indices:
+            try:
+                self.envs[i]._begin_reset()
+                pending[i] = None
+            except WORKER_ERRORS as e:
+                pending[i] = e
+        observations = []
+        for i in indices:
+            error = pending[i]
+            for attempt in range(MAX_RESET_ATTEMPTS):
+                try:
+                    if error is not None:
+                        log.warning("Starting SC2 game %d failed (attempt %d): %s", i, attempt, error)
+                        self.envs[i].kill_worker()
+                        self.envs[i]._begin_reset()
+                    obs, self.reset_infos[i] = self.envs[i]._finish_reset()
+                    break
+                except WORKER_ERRORS as e:
+                    error = e
+            else:
+                raise RuntimeError(f"SC2 game {i} failed to start {MAX_RESET_ATTEMPTS} times") from error
+            observations.append(obs)
+        return observations
 
     def close(self) -> None:
         for env in self.envs:
