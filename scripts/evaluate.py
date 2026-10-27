@@ -2,6 +2,7 @@
 
 python scripts/evaluate.py checkpoints/<run>/final.zip
 python scripts/evaluate.py checkpoints/<run>/final.zip --difficulty Easy --games 50
+python scripts/evaluate.py checkpoints/<run>/rl_model_50000_steps.zip --games 1 --realtime   # watch one game
 """
 
 from __future__ import annotations
@@ -27,6 +28,7 @@ def main() -> None:
     parser.add_argument("--time-limit", type=int, default=20 * 60, help="game-time seconds before a tie")
     parser.add_argument("--stochastic", action="store_true", help="sample actions instead of picking the best")
     parser.add_argument("--replay-dir", default=None, help="save a replay of every game here")
+    parser.add_argument("--realtime", action="store_true", help="play at normal speed so you can watch")
     args = parser.parse_args()
 
     config = GameConfig(
@@ -35,6 +37,7 @@ def main() -> None:
         enemy_race=args.enemy_race,
         game_time_limit=args.time_limit,
         save_replay_dir=args.replay_dir,
+        realtime=args.realtime,
     )
     n_envs = min(args.n_envs, args.games)
     venv = SC2VecEnv([config] * n_envs)
