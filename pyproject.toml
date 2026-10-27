@@ -10,6 +10,7 @@ requires-python = ">=3.10"
 dependencies = [
     "burnysc2>=7.0",
     "gymnasium>=0.29",
+    "loguru",
     "numpy>=1.24",
     "stable-baselines3>=2.3",
     "sb3-contrib>=2.3",

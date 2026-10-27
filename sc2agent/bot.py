@@ -35,9 +35,16 @@ class RLBot(BotAI):
         self.sent_done = False
         self._leaving = False
         self._last_killed_value = 0.0
+        self.launch_lock = None
+
+    def release_launch_lock(self) -> None:
+        if self.launch_lock is not None:
+            self.launch_lock.release()
+            self.launch_lock = None
 
     async def on_start(self) -> None:
         self.client.game_step = self.config.step_loops
+        self.release_launch_lock()
 
     async def on_step(self, iteration: int) -> None:
         self.conn.send(("obs", features.observe(self), actions.action_mask(self), self._shaping_reward(), {}))
