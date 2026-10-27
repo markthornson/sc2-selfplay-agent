@@ -28,29 +28,22 @@ Standard-mappet er `AcropolisLE`. Flere maps (også dem AI Arena bruger) kan hen
 
 ### 3. Python-miljø
 
-Brug Python 3.10–3.12. Kør i en terminal (PowerShell) i repo-mappen:
+Brug Python 3.10–3.13. Kør i PowerShell i repo-mappen:
 
 ```powershell
-py -3.12 -m venv .venv
-.venv\Scripts\activate
-# PyTorch med CUDA til dit RTX-kort (se https://pytorch.org/get-started/locally/ for den aktuelle kommando)
-pip install torch --index-url https://download.pytorch.org/whl/cu124
-pip install -e ".[dev]"
+.\setup.bat
 ```
 
-Tjek at GPU'en bliver fundet:
+Scriptet opretter `.venv`, installerer PyTorch med CUDA og resten af pakkerne og kører testene til sidst. Vil du gøre det i hånden, så se kommandoerne i `setup.bat`.
 
-```powershell
-python -c "import torch; print(torch.cuda.is_available(), torch.cuda.get_device_name(0))"
-```
+Scriptet skriver `CUDA: True`, når GPU'en bliver fundet.
 
 ### 4. Smoke-test
 
 ```powershell
-pytest                                   # tester miljøet uden at starte SC2
-python scripts/smoke_test.py --realtime  # ét spil mod VeryEasy i normal hastighed, så du kan se med
-python scripts/smoke_test.py             # samme spil i fuld fart
-python scripts/smoke_test.py --policy random
+.\smoke.bat --realtime         # ét spil mod VeryEasy i normal hastighed, så du kan se med
+.\smoke.bat                    # samme spil i fuld fart
+.\smoke.bat --policy random
 ```
 
 Den scriptede politik bygger marines og angriber, og den bør vinde mod `VeryEasy`. Det viser, at handlingsrummet kan vinde, før vi begynder at træne. Replays gemmes i `replays/`.
