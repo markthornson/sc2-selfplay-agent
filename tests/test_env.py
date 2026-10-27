@@ -16,7 +16,7 @@ from sc2agent.features import OBS_SIZE
 GAME_LENGTH = 3
 
 
-def fake_worker(conn, config):
+def fake_worker(conn, config, launch_lock=None):
     """Plays fake games of GAME_LENGTH decisions that always end in victory."""
     mask = np.ones(NUM_ACTIONS, dtype=bool)
     while True:
@@ -32,7 +32,7 @@ def fake_worker(conn, config):
             conn.send(("done", obs, mask, 1.0, {"result": "Victory", "truncated": False}))
 
 
-def crash_once_worker(conn, config):
+def crash_once_worker(conn, config, launch_lock=None):
     """Dies mid-game the first time it runs (marker file in save_replay_dir), then behaves."""
     marker = Path(config.save_replay_dir) / "crashed"
     if not marker.exists():
@@ -44,7 +44,7 @@ def crash_once_worker(conn, config):
     fake_worker(conn, config)
 
 
-def broken_worker(conn, config):
+def broken_worker(conn, config, launch_lock=None):
     conn.recv()
     conn.send(("error", "Traceback: map not found"))
     conn.recv()

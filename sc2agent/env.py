@@ -29,34 +29,52 @@ from sc2agent.features import OBS_CLIP, OBS_SIZE
 
 RECV_TIMEOUT = 600  # seconds; the first game launch can be slow
 MAX_RESET_ATTEMPTS = 3
+# Several SC2 clients starting at the same moment can fail with "Core: access permission error",
+# so launches are serialised. A worker that dies holding the lock blocks others for at most this long.
+LAUNCH_LOCK_TIMEOUT = 120
 # What a broken or hung SC2 worker raises on the env side.
 WORKER_ERRORS = (RuntimeError, TimeoutError, EOFError, BrokenPipeError, OSError)
 
 log = logging.getLogger(__name__)
 
 
-def game_worker(conn, config: GameConfig) -> None:
-    """Worker process: waits for "reset" and then plays one game per reset."""
+def game_worker(conn, config: GameConfig, launch_lock=None) -> None:
+    """Worker process: waits for "reset" and then plays one game per reset.
+
+    `launch_lock` is shared by all workers so only one SC2 client starts at a time.
+    """
     try:
         while True:
             cmd = conn.recv()
             if cmd == "close":
                 return
             try:
-                _play_one_game(conn, config)
+                _play_one_game(conn, config, launch_lock)
             except Exception:
                 conn.send(("error", traceback.format_exc()))
     except (EOFError, KeyboardInterrupt, BrokenPipeError):
         return
 
 
-def _play_one_game(conn, config: GameConfig) -> None:
+def _play_one_game(conn, config: GameConfig, launch_lock=None) -> None:
     replay = None
     if config.save_replay_dir:
         Path(config.save_replay_dir).mkdir(parents=True, exist_ok=True)
         replay = str(Path(config.save_replay_dir) / f"{config.map_name}_{int(time.time() * 1000)}.SC2Replay")
 
     bot = RLBot(conn, config)
+    if launch_lock is not None and launch_lock.acquire(timeout=LAUNCH_LOCK_TIMEOUT):
+        # Released by the bot once the game has started, or below if it never does.
+        bot.launch_lock = launch_lock
+    try:
+        _run(bot, config, replay)
+    finally:
+        bot.release_launch_lock()
+    if not bot.sent_done:
+        raise RuntimeError("Game ended without the bot reporting a result")
+
+
+def _run(bot: RLBot, config: GameConfig, replay: str | None) -> None:
     run_game(
         maps.get(config.map_name),
         [Bot(Race.Terran, bot), Computer(Race[config.enemy_race], Difficulty[config.difficulty])],
@@ -64,8 +82,6 @@ def _play_one_game(conn, config: GameConfig) -> None:
         save_replay_as=replay,
         game_time_limit=config.game_time_limit,
     )
-    if not bot.sent_done:
-        raise RuntimeError("Game ended without the bot reporting a result")
 
 
 class SC2Env(gym.Env):
@@ -73,12 +89,13 @@ class SC2Env(gym.Env):
 
     metadata = {"render_modes": []}
 
-    def __init__(self, config: GameConfig | None = None, worker_fn=game_worker):
+    def __init__(self, config: GameConfig | None = None, worker_fn=game_worker, launch_lock=None):
         super().__init__()
         self.config = config or GameConfig()
         self.observation_space = gym.spaces.Box(0.0, OBS_CLIP, shape=(OBS_SIZE,), dtype=np.float32)
         self.action_space = gym.spaces.Discrete(NUM_ACTIONS)
         self._worker_fn = worker_fn
+        self._launch_lock = launch_lock if launch_lock is not None else mp.get_context("spawn").Lock()
         self._conn = None
         self._process = None
         self._in_game = False
@@ -130,7 +147,7 @@ class SC2Env(gym.Env):
         if self._process is None:
             ctx = mp.get_context("spawn")
             self._conn, child = ctx.Pipe()
-            self._process = ctx.Process(target=self._worker_fn, args=(child, self.config))
+            self._process = ctx.Process(target=self._worker_fn, args=(child, self.config, self._launch_lock))
             self._process.start()
             child.close()
         elif self._in_game:
@@ -181,7 +198,8 @@ class SC2VecEnv(VecEnv):
     """Runs several SC2Env games in parallel; each game lives in its own process."""
 
     def __init__(self, configs: list[GameConfig], worker_fn=game_worker):
-        self.envs = [SC2Env(c, worker_fn=worker_fn) for c in configs]
+        launch_lock = mp.get_context("spawn").Lock()
+        self.envs = [SC2Env(c, worker_fn=worker_fn, launch_lock=launch_lock) for c in configs]
         super().__init__(len(self.envs), self.envs[0].observation_space, self.envs[0].action_space)
         self._failed: dict[int, Exception] = {}
 
