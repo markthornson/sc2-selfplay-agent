@@ -1,0 +1,219 @@
+"""Gymnasium environment around a StarCraft II game against the built-in AI.
+
+Every environment owns one worker process that runs SC2 games back to back.
+`SC2VecEnv` steps several of them in parallel for Stable-Baselines3.
+"""
+
+from __future__ import annotations
+
+import atexit
+import multiprocessing as mp
+import time
+import traceback
+from pathlib import Path
+from typing import Any
+
+import gymnasium as gym
+import numpy as np
+from sc2 import maps
+from sc2.data import Difficulty, Race
+from sc2.main import run_game
+from sc2.player import Bot, Computer
+from stable_baselines3.common.vec_env.base_vec_env import VecEnv
+
+from sc2agent.actions import NUM_ACTIONS
+from sc2agent.bot import LEAVE_GAME, RLBot
+from sc2agent.config import GameConfig
+from sc2agent.features import OBS_CLIP, OBS_SIZE
+
+RECV_TIMEOUT = 600  # seconds; the first game launch can be slow
+
+
+def game_worker(conn, config: GameConfig) -> None:
+    """Worker process: waits for "reset" and then plays one game per reset."""
+    try:
+        while True:
+            cmd = conn.recv()
+            if cmd == "close":
+                return
+            try:
+                _play_one_game(conn, config)
+            except Exception:
+                conn.send(("error", traceback.format_exc()))
+    except (EOFError, KeyboardInterrupt, BrokenPipeError):
+        return
+
+
+def _play_one_game(conn, config: GameConfig) -> None:
+    replay = None
+    if config.save_replay_dir:
+        Path(config.save_replay_dir).mkdir(parents=True, exist_ok=True)
+        replay = str(Path(config.save_replay_dir) / f"{config.map_name}_{int(time.time() * 1000)}.SC2Replay")
+
+    bot = RLBot(conn, config)
+    run_game(
+        maps.get(config.map_name),
+        [Bot(Race.Terran, bot), Computer(Race[config.enemy_race], Difficulty[config.difficulty])],
+        realtime=config.realtime,
+        save_replay_as=replay,
+        game_time_limit=config.game_time_limit,
+    )
+    if not bot.sent_done:
+        raise RuntimeError("Game ended without the bot reporting a result")
+
+
+class SC2Env(gym.Env):
+    """One Terran agent against one built-in AI. Supports action masking via `action_masks()`."""
+
+    metadata = {"render_modes": []}
+
+    def __init__(self, config: GameConfig | None = None, worker_fn=game_worker):
+        super().__init__()
+        self.config = config or GameConfig()
+        self.observation_space = gym.spaces.Box(0.0, OBS_CLIP, shape=(OBS_SIZE,), dtype=np.float32)
+        self.action_space = gym.spaces.Discrete(NUM_ACTIONS)
+        self._worker_fn = worker_fn
+        self._conn = None
+        self._process = None
+        self._in_game = False
+        self._mask = np.ones(NUM_ACTIONS, dtype=bool)
+        atexit.register(self.close)
+
+    # --- Gymnasium API -------------------------------------------------
+
+    def reset(self, *, seed: int | None = None, options: dict | None = None):
+        super().reset(seed=seed)
+        self._begin_reset()
+        return self._finish_reset()
+
+    def step(self, action):
+        self._send_action(action)
+        return self._finish_step()
+
+    def action_masks(self) -> np.ndarray:
+        return self._mask.copy()
+
+    def close(self) -> None:
+        if self._process is None:
+            return
+        try:
+            if self._in_game:
+                self._abandon_game()
+            self._conn.send("close")
+        except (BrokenPipeError, EOFError, OSError, RuntimeError):
+            pass
+        self._process.join(timeout=30)
+        if self._process.is_alive():
+            self._process.terminate()
+        self._conn.close()
+        self._process = None
+        self._conn = None
+
+    # --- Split API so SC2VecEnv can run several games at once ----------
+
+    def _begin_reset(self) -> None:
+        if self._process is None:
+            ctx = mp.get_context("spawn")
+            self._conn, child = ctx.Pipe()
+            self._process = ctx.Process(target=self._worker_fn, args=(child, self.config))
+            self._process.start()
+            child.close()
+        elif self._in_game:
+            self._abandon_game()
+        self._conn.send("reset")
+
+    def _finish_reset(self):
+        kind, obs, mask, _reward, info = self._receive()
+        if kind != "obs":
+            raise RuntimeError(f"Game ended before the first observation: {info}")
+        self._in_game = True
+        self._mask = mask
+        return obs, info
+
+    def _send_action(self, action) -> None:
+        if not self._in_game:
+            raise RuntimeError("step() called without an active game; call reset() first")
+        self._conn.send(int(action))
+
+    def _finish_step(self):
+        kind, obs, mask, reward, info = self._receive()
+        self._mask = mask
+        if kind == "done":
+            self._in_game = False
+            truncated = bool(info.get("truncated", False))
+            return obs, float(reward), not truncated, truncated, info
+        return obs, float(reward), False, False, info
+
+    def _abandon_game(self) -> None:
+        self._conn.send(LEAVE_GAME)
+        while self._receive()[0] != "done":
+            self._conn.send(LEAVE_GAME)
+        self._in_game = False
+
+    def _receive(self):
+        if not self._conn.poll(RECV_TIMEOUT):
+            raise TimeoutError(f"No message from the SC2 worker in {RECV_TIMEOUT}s")
+        msg = self._conn.recv()
+        if msg[0] == "error":
+            self._in_game = False
+            raise RuntimeError(f"SC2 worker failed:\n{msg[1]}")
+        return msg
+
+
+class SC2VecEnv(VecEnv):
+    """Runs several SC2Env games in parallel; each game lives in its own process."""
+
+    def __init__(self, configs: list[GameConfig], worker_fn=game_worker):
+        self.envs = [SC2Env(c, worker_fn=worker_fn) for c in configs]
+        super().__init__(len(self.envs), self.envs[0].observation_space, self.envs[0].action_space)
+        self._actions = None
+
+    def reset(self):
+        for env in self.envs:
+            env._begin_reset()
+        results = [env._finish_reset() for env in self.envs]
+        self.reset_infos = [info for _, info in results]
+        return np.stack([obs for obs, _ in results])
+
+    def step_async(self, actions: np.ndarray) -> None:
+        for env, action in zip(self.envs, actions):
+            env._send_action(action)
+
+    def step_wait(self):
+        results = [env._finish_step() for env in self.envs]
+        obs_out, rewards, dones, infos = [], [], [], []
+        finished = []
+        for i, (obs, reward, terminated, truncated, info) in enumerate(results):
+            info = dict(info)
+            if terminated or truncated:
+                info["terminal_observation"] = obs
+                info["TimeLimit.truncated"] = truncated and not terminated
+                self.envs[i]._begin_reset()
+                finished.append(i)
+            obs_out.append(obs)
+            rewards.append(reward)
+            dones.append(terminated or truncated)
+            infos.append(info)
+        for i in finished:
+            obs_out[i], self.reset_infos[i] = self.envs[i]._finish_reset()
+        return np.stack(obs_out), np.array(rewards, dtype=np.float32), np.array(dones), infos
+
+    def close(self) -> None:
+        for env in self.envs:
+            env.close()
+
+    def _targets(self, indices):
+        return [self.envs[i] for i in self._get_indices(indices)]
+
+    def get_attr(self, attr_name: str, indices=None) -> list[Any]:
+        return [getattr(env, attr_name) for env in self._targets(indices)]
+
+    def set_attr(self, attr_name: str, value: Any, indices=None) -> None:
+        for env in self._targets(indices):
+            setattr(env, attr_name, value)
+
+    def env_method(self, method_name: str, *method_args, indices=None, **method_kwargs) -> list[Any]:
+        return [getattr(env, method_name)(*method_args, **method_kwargs) for env in self._targets(indices)]
+
+    def env_is_wrapped(self, wrapper_class, indices=None) -> list[bool]:
+        return [isinstance(env, wrapper_class) for env in self._targets(indices)]
