@@ -19,3 +19,5 @@ class GameConfig:
     shaping_scale: float = 1e-4
     realtime: bool = False
     save_replay_dir: str | None = None
+    # Log level for python-sc2 inside the game processes (DEBUG, INFO, WARNING, ...).
+    sc2_log_level: str = "WARNING"

@@ -9,6 +9,7 @@ from __future__ import annotations
 import atexit
 import logging
 import multiprocessing as mp
+import sys
 import time
 import traceback
 from pathlib import Path
@@ -16,6 +17,7 @@ from typing import Any
 
 import gymnasium as gym
 import numpy as np
+from loguru import logger
 from sc2 import maps
 from sc2.data import Difficulty, Race
 from sc2.main import run_game
@@ -43,6 +45,9 @@ def game_worker(conn, config: GameConfig, launch_lock=None) -> None:
 
     `launch_lock` is shared by all workers so only one SC2 client starts at a time.
     """
+    # python-sc2 logs every game start and end at INFO level; keep only warnings so training progress stays readable.
+    logger.remove()
+    logger.add(sys.stderr, level=config.sc2_log_level)
     try:
         while True:
             cmd = conn.recv()
